@@ -1,0 +1,45 @@
+# Laravel & Composer
+/vendor
+/node_modules
+.env*
+.phpunit.result.cache
+.phpunit.cache
+/.phpunit.cache
+/.phpunit.result.cache
+
+# IDE & OS
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+/fleet/
+/.fleet/
+
+# Storage & Build
+/storage/*.key
+/storage/pail
+/storage/app/cdr/TMP/
+/storage/app/cdr/IN/
+/storage/app/cdr/OUT/
+/storage/app/cdr/ERR/
+/public/build/
+/public/hot/
+/public/storage/
+
+# Misc
+Homestead.json
+Homestead.yaml
+.phpactor.json
+/.nova/
+/.zed/
+auth.json
+
+# Logs
+*.log
+
+# Backup envs
+.env.backup
+.env.production
+
+/docker/8.4/oracle/instantclient/
+/docker/**/oracle/instantclient/
