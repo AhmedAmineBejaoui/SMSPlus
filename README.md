@@ -30,14 +30,14 @@ Le driver Oracle est active dans [config/database.php](config/database.php) via 
 Variables attendues dans `.env` (exemple) :
 
 ```
-DB_CONNECTION=oracle
-DB_HOST=oracle
-DB_PORT=1521
-DB_DATABASE=XEPDB1
-DB_SERVICE_NAME=XEPDB1
-DB_USERNAME=RAPRD
-DB_PASSWORD=simplepass
-ORACLE_HOST_PORT=1522
+DB_CONNECTION=''
+DB_HOST=''
+DB_PORT=''
+DB_DATABASE=''
+DB_SERVICE_NAME=''
+DB_USERNAME=''
+DB_PASSWORD=''
+ORACLE_HOST_PORT=''
 ```
 
 ## Commandes utiles
