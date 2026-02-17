@@ -6,42 +6,49 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
-class CdrRun extends Command
+class CdrRunLocal extends Command
 {
-    protected $signature = 'cdr:run';
-    protected $description = 'FTP -> download -> validate -> load Oracle staging -> verify -> OUT/ERR -> delete remote';
+    protected $signature = 'cdr:run-local
+                            {--mmg-path= : Path to local MMG directory}
+                            {--occ-path= : Path to local OCC directory}';
+
+    protected $description = 'Upload CDR files from local computer -> validate -> load Oracle staging -> verify -> OUT/ERR';
 
     public function handle(): int
     {
-        $ftp = Storage::disk('ftp');
         $local = Storage::disk('local');
 
+        // Convert Windows paths to WSL paths
+        $defaultMmgPath = '/mnt/c/Users/Ahmed Amin Bejoui/Desktop/CDR MMG';
+        $defaultOccPath = '/mnt/c/Users/Ahmed Amin Bejoui/Desktop/CDR OCC';
+
         $sources = [
-            'MMG' => env('FTP_DIR_MMG', '/home/MMG'),
-            'OCC' => env('FTP_DIR_OCC', '/home/OCC'),
+            'MMG' => $this->option('mmg-path') ?: $defaultMmgPath,
+            'OCC' => $this->option('occ-path') ?: $defaultOccPath,
         ];
 
-        foreach ($sources as $sourceDir => $remoteBase) {
-            $this->info("=== SOURCE {$sourceDir} ({$remoteBase}) ===");
+        foreach ($sources as $sourceDir => $localPath) {
+            $this->info("=== SOURCE {$sourceDir} ({$localPath}) ===");
 
-            $remoteFiles = $ftp->files($remoteBase);
-            if (!$remoteFiles) {
-                $this->warn("No files found or cannot access: {$remoteBase}");
+            // Check if directory exists
+            if (!is_dir($localPath)) {
+                $this->warn("Directory does not exist: {$localPath}");
                 continue;
             }
 
-            foreach ($remoteFiles as $remotePath) {
-                $fileName = basename($remotePath);
+            // Get all CSV files from the directory
+            $localFiles = glob($localPath . '/*.csv');
+            if (empty($localFiles)) {
+                $this->warn("No CSV files found in: {$localPath}");
+                continue;
+            }
 
-                // on ne traite que CSV (adapte si besoin)
-                if (!str_ends_with(strtolower($fileName), '.csv')) {
-                    continue;
-                }
+            foreach ($localFiles as $localFilePath) {
+                $fileName = basename($localFilePath);
+                $fileSize = filesize($localFilePath);
 
-                $fileSize = null;
-                try { $fileSize = $ftp->size($remotePath); } catch (\Throwable $e) {}
                 if (!$fileSize || $fileSize <= 0) {
-                    $this->warn("Skip (size unknown/0): {$remotePath}");
+                    $this->warn("Skip (size 0): {$fileName}");
                     continue;
                 }
 
@@ -68,18 +75,17 @@ class CdrRun extends Command
                     [
                         'STATUS'  => 'DOWNLOADED',
                         'LOAD_TS' => now(),
-                        'MESSAGE' => null,
+                        'MESSAGE' => 'LOCAL_UPLOAD',
                     ]
                 );
 
-                // Télécharger safe: TMP/*.part -> IN/<dir>/
-                $tmpPart = "cdr/TMP/{$fileName}.part";
-                $inPath  = "cdr/IN/{$sourceDir}/{$fileName}";
+                // Copy to IN directory
+                $inPath = "cdr/IN/{$sourceDir}/{$fileName}";
 
                 try {
-                    $this->downloadAtomic($ftp, $local, $remotePath, $tmpPart, $inPath, $fileSize);
+                    $this->copyLocalToStorage($local, $localFilePath, $inPath, $fileSize);
                 } catch (\Throwable $e) {
-                    $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "DOWNLOAD_ERROR: ".$e->getMessage());
+                    $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "COPY_ERROR: ".$e->getMessage());
                     continue;
                 }
 
@@ -122,7 +128,7 @@ class CdrRun extends Command
                     continue;
                 }
 
-                // SUCCESS -> déplacer en OUT + supprimer FTP
+                // SUCCESS -> déplacer en OUT
                 DB::table('LOAD_AUDIT')
                     ->where('SOURCE_DIR', $sourceDir)
                     ->where('FILE_NAME', $fileName)
@@ -138,41 +144,29 @@ class CdrRun extends Command
                 $outPath = "cdr/OUT/{$sourceDir}/{$fileName}";
                 $local->move($inPath, $outPath);
 
-                if (filter_var(env('FTP_DELETE_AFTER_SUCCESS', true), FILTER_VALIDATE_BOOLEAN)) {
-                    try { $ftp->delete($remotePath); } catch (\Throwable $e) {}
-                }
-
-                $this->info("SUCCESS: {$fileName} rows={$rowsDbCount} -> OUT/{$sourceDir} (remote deleted)");
+                $this->info("SUCCESS: {$fileName} rows={$rowsDbCount} -> OUT/{$sourceDir}");
             }
         }
 
         return self::SUCCESS;
     }
 
-    private function downloadAtomic($ftp, $local, string $remotePath, string $tmpPart, string $finalIn, int $expectedSize): void
+    private function copyLocalToStorage($local, string $localFilePath, string $storagePath, int $expectedSize): void
     {
-        $stream = $ftp->readStream($remotePath);
-        if (!$stream) {
-            throw new \RuntimeException("Cannot readStream remote: {$remotePath}");
+        // Copy the file to storage
+        $content = file_get_contents($localFilePath);
+        if ($content === false) {
+            throw new \RuntimeException("Cannot read local file: {$localFilePath}");
         }
 
-        $out = fopen($local->path($tmpPart), 'w');
-        if (!$out) {
-            throw new \RuntimeException("Cannot write tmp: {$tmpPart}");
-        }
+        $local->put($storagePath, $content);
 
-        stream_copy_to_stream($stream, $out);
-        fclose($out);
-        if (is_resource($stream)) fclose($stream);
-
-        $localSize = filesize($local->path($tmpPart));
+        // Verify size
+        $localSize = $local->size($storagePath);
         if ($localSize !== $expectedSize) {
-            // move tmp part to ERR
-            throw new \RuntimeException("Size mismatch: local={$localSize} expected={$expectedSize}");
+            $local->delete($storagePath);
+            throw new \RuntimeException("Size mismatch: storage={$localSize} expected={$expectedSize}");
         }
-
-        // Move tmp -> IN
-        $local->move($tmpPart, $finalIn);
     }
 
     private function validateCsvStrict(string $fullPath): array
@@ -196,7 +190,7 @@ class CdrRun extends Command
             $line = rtrim($line, "\r\n");
             if ($line === '') continue;
 
-            // Règle “newline = record delimiter” + protection minimale :
+            // Règle "newline = record delimiter" + protection minimale :
             // si quotes non équilibrés => record cassé => ERR
             if ((substr_count($line, $enclosure) % 2) !== 0) {
                 fclose($fh);
@@ -216,17 +210,8 @@ class CdrRun extends Command
         return [$header, $rows];
     }
 
-    private function ensureStagingTable(string $table, array $headerCols): array
-    {
-        // Création dynamique désactivée : on suppose la table déjà existante
-        throw new \RuntimeException('ensureStagingTable() ne doit plus être appelée. Utilisez getOracleColsFromHeader.');
-    }
-
-    // Nouvelle méthode pour obtenir les noms de colonnes Oracle à partir du header CSV
     private function getOracleColsFromHeader(string $table, array $headerCols): array
     {
-        // On suppose que les noms de colonnes du CSV correspondent à ceux de la table Oracle
-        // (adapter ici si besoin de mapping ou de nettoyage)
         $oracleCols = [];
         $used = [];
         foreach ($headerCols as $col) {
