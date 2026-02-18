@@ -2,8 +2,10 @@
 
 namespace App\Console\Commands;
 
+use App\Services\CdrTransformService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
 class CdrRunLocal extends Command
@@ -97,6 +99,16 @@ class CdrRunLocal extends Command
                     continue;
                 }
 
+                // Valider colonnes contre whitelist (mode TMP: dynamique depuis Oracle)
+                $transformService = new CdrTransformService();
+                $sourceType = strtolower($sourceDir); // 'mmg' ou 'occ'
+                $validation = $transformService->validateColumns($headerCols, $sourceType, 'tmp');
+                if (!$validation['valid']) {
+                    $unknownCols = implode(', ', $validation['unknown_columns']);
+                    $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "WHITELIST_ERROR: Unknown columns: {$unknownCols}");
+                    continue;
+                }
+
                 // Créer/assurer table staging selon header
                 $table = $sourceDir === 'MMG' ? 'RA_T_TMP_MMG' : 'RA_T_TMP_OCC';
 
@@ -128,18 +140,37 @@ class CdrRunLocal extends Command
                     continue;
                 }
 
-                // SUCCESS -> déplacer en OUT
-                DB::table('LOAD_AUDIT')
-                    ->where('SOURCE_DIR', $sourceDir)
-                    ->where('FILE_NAME', $fileName)
-                    ->where('FILE_SIZE', $fileSize)
-                    ->update([
-                        'STATUS'   => 'SUCCESS',
-                        'ROWS_CSV' => $rowsCsv,
-                        'ROWS_DB'  => $rowsDbCount,
-                        'LOAD_TS'  => now(),
-                        'MESSAGE'  => 'OK',
-                    ]);
+                // Transformer TMP -> DETAIL
+                try {
+                    $transformService = new CdrTransformService();
+                    if ($sourceDir === 'OCC') {
+                        $transformStats = $transformService->transformOccTmpToDetail($fileName);
+                    } elseif ($sourceDir === 'MMG') {
+                        $transformStats = $transformService->transformMmgTmpToDetail($fileName);
+                    } else {
+                        throw new \Exception("Unknown source type: {$sourceDir}");
+                    }
+
+                    $this->info("  TMP->DETAIL: inserted={$transformStats['inserted']}, rejected={$transformStats['rejected']}");
+                    Log::channel('cdr')->info("Transform SUCCESS for {$fileName}", $transformStats);
+
+                    // SUCCESS -> déplacer en OUT
+                    DB::table('LOAD_AUDIT')
+                        ->where('SOURCE_DIR', $sourceDir)
+                        ->where('FILE_NAME', $fileName)
+                        ->where('FILE_SIZE', $fileSize)
+                        ->update([
+                            'STATUS'   => 'SUCCESS',
+                            'ROWS_CSV' => $rowsCsv,
+                            'ROWS_DB'  => $rowsDbCount,
+                            'LOAD_TS'  => now(),
+                            'MESSAGE'  => "TMP:{$transformStats['tmpRows']} DETAIL:{$transformStats['inserted']} REJECTED:{$transformStats['rejected']}",
+                        ]);
+                } catch (\Throwable $e) {
+                    Log::channel('cdr')->error("Transform FAILED for {$fileName}: ".$e->getMessage());
+                    $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "TRANSFORM_ERROR: ".$e->getMessage());
+                    continue;
+                }
 
                 $outPath = "cdr/OUT/{$sourceDir}/{$fileName}";
                 $local->move($inPath, $outPath);
