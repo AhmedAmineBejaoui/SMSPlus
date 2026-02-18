@@ -1,0 +1,36 @@
+-- One-time Oracle tuning for faster CDR loading.
+-- Run as the same schema used by Laravel (DB_USERNAME).
+
+-- 1) Speed up cleanup/transform filters on TMP by SOURCE_FILE/SOURCE_DIR
+BEGIN
+    EXECUTE IMMEDIATE 'CREATE INDEX IDX_TMP_OCC_FILE_DIR ON RA_T_TMP_OCC (SOURCE_FILE, SOURCE_DIR)';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -955 THEN RAISE; END IF; -- ORA-00955: name already used
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'CREATE INDEX IDX_TMP_MMG_FILE_DIR ON RA_T_TMP_MMG (SOURCE_FILE, SOURCE_DIR)';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
+
+-- 2) Speed up duplicate/SUCCESS checks on LOAD_AUDIT
+BEGIN
+    EXECUTE IMMEDIATE 'CREATE INDEX IDX_LOAD_AUDIT_DUPCHECK ON LOAD_AUDIT (SOURCE_DIR, FILE_NAME, FILE_SIZE, STATUS)';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -955 THEN RAISE; END IF;
+END;
+/
+
+-- 3) Refresh optimizer stats after index creation
+BEGIN
+    DBMS_STATS.GATHER_TABLE_STATS(ownname => USER, tabname => 'RA_T_TMP_OCC', cascade => TRUE);
+    DBMS_STATS.GATHER_TABLE_STATS(ownname => USER, tabname => 'RA_T_TMP_MMG', cascade => TRUE);
+    DBMS_STATS.GATHER_TABLE_STATS(ownname => USER, tabname => 'LOAD_AUDIT', cascade => TRUE);
+END;
+/

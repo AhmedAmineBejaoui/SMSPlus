@@ -31,9 +31,11 @@ class CdrRun extends Command
                 $this->warn("No files found or cannot access: {$remoteBase}");
                 continue;
             }
+            $this->line("Found " . count($remoteFiles) . " remote files.");
 
             foreach ($remoteFiles as $remotePath) {
                 $fileName = basename($remotePath);
+                $this->line("PROCESSING: {$fileName}");
 
                 // on ne traite que CSV (adapte si besoin)
                 if (!str_ends_with(strtolower($fileName), '.csv')) {
@@ -85,9 +87,10 @@ class CdrRun extends Command
                     continue;
                 }
 
-                // Validation CSV stricte (newline = record delimiter)
+                // Read/validate header only; strict row validation is done during load
                 try {
-                    [$headerCols, $rowsCsv] = $this->validateCsvStrict($local->path($inPath));
+                    $headerCols = $this->readCsvHeader($local->path($inPath));
+                    $this->line("  CSV header validated: cols=" . count($headerCols));
                 } catch (\Throwable $e) {
                     $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "CSV_INVALID: ".$e->getMessage());
                     continue;
@@ -114,8 +117,18 @@ class CdrRun extends Command
                     continue;
                 }
 
+                // Rerun idempotent: purge stale TMP rows for same file before loading
+                $staleRows = (int) DB::table($table)
+                    ->where('SOURCE_FILE', $fileName)
+                    ->where('SOURCE_DIR', $sourceDir)
+                    ->delete();
+                if ($staleRows > 0) {
+                    $this->warn("TMP cleanup before reload: {$fileName} removed={$staleRows}");
+                }
+
                 // Load DB (batch insert)
                 try {
+                    $this->line("  Loading into {$table} ...");
                     DB::beginTransaction();
                     $rowsDb = $this->loadCsvToOracle($local->path($inPath), $table, $oracleCols, $sourceDir, $fileName);
                     DB::commit();
@@ -125,14 +138,8 @@ class CdrRun extends Command
                     continue;
                 }
 
-                // Vérification rows_csv vs rows_db (COUNT by SOURCE_FILE)
-                $rowsDbCount = (int) DB::table($table)->where('SOURCE_FILE', $fileName)->count();
-                if ($rowsDbCount !== $rowsCsv) {
-                    // rollback logique : delete rows de ce fichier
-                    DB::table($table)->where('SOURCE_FILE', $fileName)->delete();
-                    $this->failToErr($local, $sourceDir, $inPath, $fileName, $fileSize, "COUNT_MISMATCH rows_csv={$rowsCsv} rows_db={$rowsDbCount}");
-                    continue;
-                }
+                $rowsCsv = $rowsDb;
+                $rowsDbCount = $rowsDb;
 
                 // Transformer TMP -> DETAIL
                 try {
@@ -206,7 +213,7 @@ class CdrRun extends Command
         $local->move($tmpPart, $finalIn);
     }
 
-    private function validateCsvStrict(string $fullPath): array
+    private function readCsvHeader(string $fullPath): array
     {
         $delimiter = env('CSV_DELIMITER', ',');
         $enclosure = env('CSV_ENCLOSURE', '"');
@@ -215,36 +222,14 @@ class CdrRun extends Command
         if (!$fh) throw new \RuntimeException("Cannot open file");
 
         $firstLine = fgets($fh);
-        if ($firstLine === false) throw new \RuntimeException("Empty file");
-        $firstLine = rtrim($firstLine, "\r\n");
-
-        $header = str_getcsv($firstLine, $delimiter, $enclosure);
-        $nHeader = count($header);
-        if ($nHeader < 1) throw new \RuntimeException("Invalid header");
-
-        $rows = 0;
-        while (($line = fgets($fh)) !== false) {
-            $line = rtrim($line, "\r\n");
-            if ($line === '') continue;
-
-            // Règle “newline = record delimiter” + protection minimale :
-            // si quotes non équilibrés => record cassé => ERR
-            if ((substr_count($line, $enclosure) % 2) !== 0) {
-                fclose($fh);
-                throw new \RuntimeException("Broken line (unbalanced quotes) at data line ".($rows+2));
-            }
-
-            $cols = str_getcsv($line, $delimiter, $enclosure);
-            if (count($cols) !== $nHeader) {
-                fclose($fh);
-                throw new \RuntimeException("Wrong column count at data line ".($rows+2)." got=".count($cols)." expected={$nHeader}");
-            }
-
-            $rows++;
-        }
-
         fclose($fh);
-        return [$header, $rows];
+        if ($firstLine === false) throw new \RuntimeException("Empty file");
+
+        $firstLine = rtrim($firstLine, "\r\n");
+        $header = str_getcsv($firstLine, $delimiter, $enclosure);
+        if (count($header) < 1) throw new \RuntimeException("Invalid header");
+
+        return $header;
     }
 
     private function ensureStagingTable(string $table, array $headerCols): array
@@ -282,7 +267,8 @@ class CdrRun extends Command
     {
         $delimiter = env('CSV_DELIMITER', ',');
         $enclosure = env('CSV_ENCLOSURE', '"');
-        $batchSize = (int) env('CDR_BATCH_SIZE', 500);
+        $batchSize = max(200, (int) env('CDR_BATCH_SIZE', 2000));
+        $progressEvery = (int) env('CDR_PROGRESS_EVERY', 50000);
 
         DB::disableQueryLog();
 
@@ -290,6 +276,7 @@ class CdrRun extends Command
         if (!$fh) throw new \RuntimeException("Cannot open file");
 
         fgets($fh); // skip header
+        $expectedCols = count($oracleCols);
 
         // Colonnes bindées (CSV + SOURCE_FILE + SOURCE_DIR) + LOAD_TS via SYSDATE
         $bindCols  = array_merge($oracleCols, ['SOURCE_FILE', 'SOURCE_DIR']);
@@ -306,11 +293,21 @@ class CdrRun extends Command
         $batch = [];
         $count = 0;
 
+        $lineNo = 1; // header
         while (($line = fgets($fh)) !== false) {
+            $lineNo++;
             $line = rtrim($line, "\r\n");
             if ($line === '') continue;
 
+            // Keep strict CSV rule while loading to avoid a second full-file pass.
+            if ((substr_count($line, $enclosure) % 2) !== 0) {
+                throw new \RuntimeException("Broken line (unbalanced quotes) at data line {$lineNo}");
+            }
+
             $vals = str_getcsv($line, $delimiter, $enclosure);
+            if (count($vals) !== $expectedCols) {
+                throw new \RuntimeException("Wrong column count at data line {$lineNo} got=".count($vals)." expected={$expectedCols}");
+            }
 
             $row = [];
             foreach ($oracleCols as $i => $colName) {
@@ -327,7 +324,7 @@ class CdrRun extends Command
                 $batch = [];
             }
 
-            if ($count % 50000 === 0) {
+            if ($progressEvery > 0 && $count % $progressEvery === 0) {
                 $this->info("  ... {$count} rows loaded");
             }
         }

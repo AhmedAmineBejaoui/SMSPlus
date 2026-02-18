@@ -32,7 +32,7 @@ return [
     | Taille des lots pour les insertions en masse (déjà utilisé dans loadCsvToOracle)
     |
     */
-    'batch_size' => (int) env('CDR_BATCH_SIZE', 500),
+    'batch_size' => (int) env('CDR_BATCH_SIZE', 2000),
 
     /*
     |--------------------------------------------------------------------------

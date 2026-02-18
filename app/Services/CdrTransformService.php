@@ -329,8 +329,8 @@ SQL;
     {
         try {
             $results = DB::select(
-                "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = :table ORDER BY COLUMN_ID",
-                ['table' => strtoupper($tableName)]
+                "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = :table_name ORDER BY COLUMN_ID",
+                ['table_name' => strtoupper($tableName)]
             );
 
             return array_map(fn($row) => $row->column_name, $results);
