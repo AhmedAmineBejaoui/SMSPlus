@@ -42,7 +42,6 @@ jobs:
         shell: bash
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
-          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -72,14 +71,8 @@ jobs:
               metadata: { actor: $actor }
             }' > request.json
 
-          auth_args=()
-          if [ -n "${API_TOKEN:-}" ]; then
-            auth_args=(-H "Authorization: Bearer $API_TOKEN")
-          fi
-
           RESP=$(curl --fail-with-body -sS -X POST "$API_URL/v1/analyze" \
             -H "Content-Type: application/json" \
-            "${auth_args[@]}" \
             --data-binary @request.json)
 
           echo "Response: $RESP"
@@ -95,20 +88,14 @@ jobs:
         shell: bash
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
-          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
         run: |
           set -euo pipefail
 
           API_URL="${API_URL%/}"
           ID="${{ steps.call.outputs.analysis_id }}"
 
-          auth_args=()
-          if [ -n "${API_TOKEN:-}" ]; then
-            auth_args=(-H "Authorization: Bearer $API_TOKEN")
-          fi
-
           for i in {1..24}; do
-            RESP=$(curl --fail-with-body -sS "$API_URL/v1/analyses/$ID" "${auth_args[@]}")
+            RESP=$(curl --fail-with-body -sS "$API_URL/v1/analyses/$ID")
             STATUS=$(echo "$RESP" | jq -r '.status')
             echo "Attempt $i -> status: $STATUS"
 
