@@ -1,0 +1,155 @@
+name: AI Code Review (CI Mode)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  ai_review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute PR diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "BASE_SHA=$BASE_SHA"
+          echo "HEAD_SHA=$HEAD_SHA"
+
+          git diff --unified=3 "$BASE_SHA" "$HEAD_SHA" > pr.diff
+
+          MAX_BYTES=900000
+          BYTES=$(wc -c < pr.diff)
+          echo "Diff size bytes: $BYTES"
+          if [ "$BYTES" -gt "$MAX_BYTES" ]; then
+            echo "Diff too large ($BYTES bytes > $MAX_BYTES)."
+            exit 1
+          fi
+
+      - name: Call backend /v1/analyze
+        id: call
+        shell: bash
+        env:
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${API_URL:-}" ]; then
+            echo "Missing secret AI_REVIEW_API_URL"
+            exit 1
+          fi
+
+          API_URL="${API_URL%/}"
+          REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          ACTOR="${{ github.actor }}"
+
+          jq -n \
+            --arg repo "$REPO" \
+            --argjson pr_number "$PR_NUMBER" \
+            --arg commit_sha "$HEAD_SHA" \
+            --rawfile diff_text pr.diff \
+            --arg actor "$ACTOR" \
+            '{
+              source: "github_actions",
+              repo: $repo,
+              pr_number: $pr_number,
+              commit_sha: $commit_sha,
+              diff_text: $diff_text,
+              metadata: { actor: $actor }
+            }' > request.json
+
+          auth_args=()
+          if [ -n "${API_TOKEN:-}" ]; then
+            auth_args=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+
+          RESP=$(curl --fail-with-body -sS -X POST "$API_URL/v1/analyze" \
+            -H "Content-Type: application/json" \
+            "${auth_args[@]}" \
+            --data-binary @request.json)
+
+          echo "Response: $RESP"
+          ANALYSIS_ID=$(echo "$RESP" | jq -r '.analysis_id')
+          if [ "$ANALYSIS_ID" = "null" ] || [ -z "$ANALYSIS_ID" ]; then
+            echo "No analysis_id returned."
+            exit 1
+          fi
+
+          echo "analysis_id=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Poll analysis result
+        shell: bash
+        env:
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          API_URL="${API_URL%/}"
+          ID="${{ steps.call.outputs.analysis_id }}"
+
+          auth_args=()
+          if [ -n "${API_TOKEN:-}" ]; then
+            auth_args=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+
+          for i in {1..24}; do
+            RESP=$(curl --fail-with-body -sS "$API_URL/v1/analyses/$ID" "${auth_args[@]}")
+            STATUS=$(echo "$RESP" | jq -r '.status')
+            echo "Attempt $i -> status: $STATUS"
+
+            if [ "$STATUS" = "done" ]; then
+              echo "$RESP" > result.json
+              break
+            fi
+
+            if [ "$STATUS" = "failed" ]; then
+              echo "$RESP"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ ! -f result.json ]; then
+            echo "Timeout waiting for analysis completion."
+            exit 1
+          fi
+
+      - name: Decide PASS/WARN/FAIL
+        shell: bash
+        run: |
+          set -euo pipefail
+          DECISION=$(jq -r '.decision // "PASS"' result.json)
+          echo "Decision: $DECISION"
+
+          if [ "$DECISION" = "FAIL" ]; then
+            echo "Blocking merge because decision=FAIL"
+            exit 1
+          fi
+
+          echo "Allow merge for PASS/WARN"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-result
+          path: |
+            pr.diff
+            request.json
+            result.json
