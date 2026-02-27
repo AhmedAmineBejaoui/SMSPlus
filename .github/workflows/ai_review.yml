@@ -1,80 +1,177 @@
-name: ai_review
+# ──────────────────────────────────────────────────────────────
+# AI Code Review — CI Mode  (GitHub Actions)
+#
+# Triggers on every PR (opened / synchronize / reopened).
+# 1) Computes the unified diff between base..head
+# 2) POSTs it to  POST /v1/analyze
+# 3) Polls        GET  /v1/analyses/{id}  until done/failed
+# 4) Decides PASS / WARN / FAIL  (FAIL → blocks merge)
+# ──────────────────────────────────────────────────────────────
+name: AI Code Review (RAG)
+
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: ["main"]
 
 jobs:
   ai_review:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
     steps:
+      # ── 1. Checkout (full history so diff works) ──
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Compute diff (PR or Push)
+      # ── 2. Compute unified diff ──
+      - name: Compute PR diff
         id: diff
         shell: bash
         run: |
-          set -euo pipefail
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "mode=pr" >> "$GITHUB_OUTPUT"
-            echo "base_sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
-            echo "pr_number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=push" >> "$GITHUB_OUTPUT"
-            echo "base_sha=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
-            echo "head_sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-            echo "pr_number=null" >> "$GITHUB_OUTPUT"
-          fi
-          # توليد الـ diff في ملف
-          git diff --unified=3 "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}" "${{ github.sha }}" > pr.diff
+          set -e
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          echo "BASE=$BASE_SHA  HEAD=$HEAD_SHA"
 
-      - name: Call backend /v1/analyze
-        env:
-          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+          git diff --unified=3 "$BASE_SHA" "$HEAD_SHA" > pr.diff
+
+          # size guard (900 KB max)
+          MAX_BYTES=900000
+          BYTES=$(wc -c < pr.diff)
+          echo "Diff size: $BYTES bytes"
+          if [ "$BYTES" -gt "$MAX_BYTES" ]; then
+            echo "::error::Diff too large ($BYTES bytes > $MAX_BYTES)"
+            exit 1
+          fi
+
+          # base64-encode to survive shell / JSON escaping
+          DIFF_B64=$(base64 -w 0 pr.diff)
+          echo "diff_b64=$DIFF_B64" >> "$GITHUB_OUTPUT"
+
+      # ── 3. POST /v1/analyze ──
+      - name: Submit diff for analysis
+        id: call
         shell: bash
+        env:
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}    # e.g. https://xxxx.ngrok-free.app
+          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }} # optional bearer token
         run: |
-          set -euo pipefail
-          
-          # استخراج القيم من الخطوة السابقة
-          MODE="${{ steps.diff.outputs.mode }}"
-          BASE_SHA="${{ steps.diff.outputs.base_sha }}"
-          HEAD_SHA="${{ steps.diff.outputs.head_sha }}"
-          PR_NUM=${{ steps.diff.outputs.pr_number }}
+          set -e
+
           REPO="${{ github.repository }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           ACTOR="${{ github.actor }}"
 
-          # استعمال jq لبناء JSON صحيح 100% لتفادي مشاكل الـ Escaping
-          jq -n \
-            --arg source "github_actions" \
-            --arg repo "$REPO" \
-            --argjson pr_number "$PR_NUM" \
-            --arg commit_sha "$HEAD_SHA" \
-            --rawfile diff_text pr.diff \
-            --arg actor "$ACTOR" \
-            --arg mode "$MODE" \
-            --arg base_sha "$BASE_SHA" \
-            '{
-              source: $source,
-              repo: $repo,
-              pr_number: $pr_number,
-              commit_sha: $commit_sha,
-              diff_text: $diff_text,
-              metadata: {
-                actor: $actor,
-                mode: $mode,
-                base_sha: $base_sha
-              }
-            }' > request.json
+          # decode diff back to text
+          echo "${{ steps.diff.outputs.diff_b64 }}" | base64 -d > pr.diff
 
-          echo "Sending request to $API_URL/v1/analyze..."
-          
-          # إرسال الطلب والتثبت من النتيجة
-          curl -sS -L -X POST "$API_URL/v1/analyze" \
+          # build JSON payload
+          JSON=$(jq -n \
+            --arg repo       "$REPO" \
+            --argjson pr_num  "$PR_NUMBER" \
+            --arg sha        "$HEAD_SHA" \
+            --arg diff       "$(cat pr.diff)" \
+            --arg actor      "$ACTOR" \
+            '{
+              source:     "github_actions",
+              repo:       $repo,
+              pr_number:  $pr_num,
+              commit_sha: $sha,
+              diff_text:  $diff,
+              metadata:   { actor: $actor }
+            }')
+
+          echo "$JSON" > request.json
+
+          RESP=$(curl -sS -w "\n%{http_code}" -X POST "$API_URL/v1/analyze" \
             -H "Content-Type: application/json" \
-            --data-binary @request.json \
-            --fail-with-body
+            -H "Authorization: Bearer $API_TOKEN" \
+            --data-binary @request.json)
+
+          HTTP_CODE=$(echo "$RESP" | tail -1)
+          BODY=$(echo "$RESP" | sed '$d')
+          echo "HTTP $HTTP_CODE — $BODY"
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::API returned $HTTP_CODE"
+            exit 1
+          fi
+
+          ANALYSIS_ID=$(echo "$BODY" | jq -r '.analysis_id')
+
+          if [ "$ANALYSIS_ID" = "null" ] || [ -z "$ANALYSIS_ID" ]; then
+            echo "::error::No analysis_id in response"
+            exit 1
+          fi
+
+          echo "analysis_id=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Poll GET /v1/analyses/{id} ──
+      - name: Poll analysis result
+        id: poll
+        shell: bash
+        env:
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
+        run: |
+          set -e
+          ID="${{ steps.call.outputs.analysis_id }}"
+          echo "Polling analysis $ID …"
+
+          for i in $(seq 1 18); do          # up to 90 s
+            RESP=$(curl -sS "$API_URL/v1/analyses/$ID" \
+              -H "Authorization: Bearer $API_TOKEN")
+
+            STATUS=$(echo "$RESP" | jq -r '.status')
+            echo "  [$i] status=$STATUS"
+
+            if [ "$STATUS" = "done" ]; then
+              echo "$RESP" > result.json
+              break
+            fi
+
+            if [ "$STATUS" = "failed" ]; then
+              echo "::error::Analysis failed — $RESP"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          if [ ! -f result.json ]; then
+            echo "::error::Timeout waiting for analysis"
+            exit 1
+          fi
+
+      # ── 5. Gate: PASS / WARN / FAIL ──
+      - name: Decide PASS / WARN / FAIL
+        shell: bash
+        run: |
+          set -e
+          DECISION=$(jq -r '.decision // "PASS"' result.json)
+          FINDINGS=$(jq '.findings | length' result.json)
+          echo "Decision: $DECISION  ($FINDINGS findings)"
+
+          if [ "$DECISION" = "FAIL" ]; then
+            echo "::error::Review decision is FAIL — blocking merge"
+            jq '.findings[] | "  [\(.severity)] \(.rule_id): \(.message)"' -r result.json
+            exit 1
+          fi
+
+          echo "Review passed ($DECISION)"
+
+      # ── 6. Always upload artifacts ──
+      - name: Upload review artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-result
+          path: |
+            pr.diff
+            request.json
+            result.json
