@@ -123,19 +123,26 @@ jobs:
           ID="${{ steps.call.outputs.analysis_id }}"
           echo "Polling analysis $ID …"
 
-          for i in $(seq 1 18); do          # up to 90 s
+          for i in $(seq 1 60); do   # up to 5 minutes
             RESP=$(curl -sS "$API_URL/v1/analyses/$ID" \
               -H "Authorization: Bearer $API_TOKEN")
 
-            STATUS=$(echo "$RESP" | jq -r '.status')
+            STATUS=$(echo "$RESP" | jq -r '.status // .data.status // empty' | tr -d '\r\n ')
             echo "  [$i] status=$STATUS"
 
-            if [ "$STATUS" = "done" ]; then
+            # Debug إذا status فارغ
+            if [ -z "$STATUS" ]; then
+              echo "WARN: status not found. Response preview:"
+              echo "$RESP" | head -c 500
+              echo ""
+            fi
+
+            if [ "$STATUS" = "COMPLETED" ]; then
               echo "$RESP" > result.json
               break
             fi
 
-            if [ "$STATUS" = "failed" ]; then
+            if [ "$STATUS" = "FAILED" ]; then
               echo "::error::Analysis failed — $RESP"
               exit 1
             fi
