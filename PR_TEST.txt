@@ -1,1 +1,24 @@
-TEST_TEST01
+وزيد: 60 * 5s = 5 دقائق، إذا pipeline متاعك تتأخر (خصوصًا مع Semgrep) توصل timeout.
+
+✅ التعديلات اللي ننصح بها (3 تغييرات أساسية)
+1) Poll: زيد check للـ HTTP CODE + retry clean
+
+حاليًا لو API رجعت 502/504 أو HTML من ngrok، jq يعطي status فارغ وتبقى تدور حتى timeout.
+
+✅ خليه يرفض مباشرة إذا HTTP != 200 أو يعمل retry مضبوط.
+
+2) Poll: خذ status من أكثر من مكان + normalize
+
+بعض APIs ترجع: { "data": { "status": "COMPLETED" } }
+
+بعض ترجع: { "status": "COMPLETED" }
+
+✅ اعمل extraction robust.
+
+3) زيد وقت polling شوية (Semgrep ينجم يطوّل)
+
+خليها 10 دقائق بدل 5، أو خليه configurable عبر env.
+
+✅ نسخة Workflow محسّنة (بدّل فقط Step “Poll analysis result”)
+
+انسخ هذا Step وحطّه بدل الحالي:
