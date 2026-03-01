@@ -22,3 +22,8 @@
 ✅ نسخة Workflow محسّنة (بدّل فقط Step “Poll analysis result”)
 
 انسخ هذا Step وحطّه بدل الحالي:
+
+
+
+
+DONE OK
