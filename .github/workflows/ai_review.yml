@@ -1,12 +1,3 @@
-# ──────────────────────────────────────────────────────────────
-# AI Code Review — CI Mode  (GitHub Actions)
-#
-# Triggers on every PR (opened / synchronize / reopened).
-# 1) Computes the unified diff between base..head
-# 2) POSTs it to  POST /v1/analyze
-# 3) Polls        GET  /v1/analyses/{id}  until done/failed
-# 4) Decides PASS / WARN / FAIL  (FAIL → blocks merge)
-# ──────────────────────────────────────────────────────────────
 name: AI Code Review (RAG)
 
 on:
@@ -21,26 +12,25 @@ jobs:
       pull-requests: read
 
     steps:
-      # ── 1. Checkout (full history so diff works) ──
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── 2. Compute unified diff ──
       - name: Compute PR diff
         id: diff
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           echo "BASE=$BASE_SHA  HEAD=$HEAD_SHA"
 
           git diff --unified=3 "$BASE_SHA" "$HEAD_SHA" > pr.diff
 
-          # size guard (900 KB max)
-          MAX_BYTES=900000
+          # backend MAX_DIFF_BYTES = 2_000_000, on garde une marge
+          MAX_BYTES=1900000
           BYTES=$(wc -c < pr.diff)
           echo "Diff size: $BYTES bytes"
           if [ "$BYTES" -gt "$MAX_BYTES" ]; then
@@ -48,102 +38,133 @@ jobs:
             exit 1
           fi
 
-          # base64-encode to survive shell / JSON escaping
-          DIFF_B64=$(base64 -w 0 pr.diff)
-          echo "diff_b64=$DIFF_B64" >> "$GITHUB_OUTPUT"
-
-      # ── 3. POST /v1/analyze ──
       - name: Submit diff for analysis
         id: call
         shell: bash
         env:
-          API_URL: ${{ secrets.AI_REVIEW_API_URL }}    # e.g. https://xxxx.ngrok-free.app
-          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }} # optional bearer token
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}   # optionnel
+          API_USER_ID: ${{ secrets.AI_REVIEW_USER_ID }}   # optionnel (si RBAC activé côté backend)
         run: |
-          set -e
+          set -euo pipefail
+
+          API_URL="${API_URL%/}"
 
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
           ACTOR="${{ github.actor }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          COMMIT_MESSAGE="$(git log -1 --pretty=%s "$HEAD_SHA" 2>/dev/null || true)"
+          LABELS_JSON="$(jq -c '[.pull_request.labels[]?.name]' "$GITHUB_EVENT_PATH")"
 
-          # decode diff back to text
-          echo "${{ steps.diff.outputs.diff_b64 }}" | base64 -d > pr.diff
-
-          # build JSON payload
-          JSON=$(jq -n \
-            --arg repo       "$REPO" \
-            --argjson pr_num  "$PR_NUMBER" \
-            --arg sha        "$HEAD_SHA" \
-            --arg diff       "$(cat pr.diff)" \
-            --arg actor      "$ACTOR" \
+          jq -n \
+            --rawfile diff pr.diff \
+            --arg repo "$REPO" \
+            --argjson pr_num "$PR_NUMBER" \
+            --arg sha "$HEAD_SHA" \
+            --arg actor "$ACTOR" \
+            --arg title "$PR_TITLE" \
+            --arg branch "$PR_BRANCH" \
+            --arg commit_message "$COMMIT_MESSAGE" \
+            --argjson labels "$LABELS_JSON" \
             '{
-              source:     "github_actions",
-              repo:       $repo,
-              pr_number:  $pr_num,
+              source: "github_actions",
+              repo: $repo,
+              pr_number: $pr_num,
               commit_sha: $sha,
-              diff_text:  $diff,
-              metadata:   { actor: $actor }
-            }')
+              diff_text: $diff,
+              metadata: {
+                actor: $actor,
+                title: $title,
+                labels: $labels,
+                branch: $branch,
+                commit_message: $commit_message
+              }
+            }' > request.json
 
-          echo "$JSON" > request.json
-
-          RESP=$(curl -sS -w "\n%{http_code}" -X POST "$API_URL/v1/analyze" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $API_TOKEN" \
-            --data-binary @request.json)
-
-          HTTP_CODE=$(echo "$RESP" | tail -1)
-          BODY=$(echo "$RESP" | sed '$d')
-          echo "HTTP $HTTP_CODE — $BODY"
-
-          if [ "$HTTP_CODE" -ge 400 ]; then
-            echo "::error::API returned $HTTP_CODE"
-            exit 1
+          CURL_HEADERS=(-H "Content-Type: application/json")
+          if [ -n "${API_TOKEN:-}" ]; then
+            CURL_HEADERS+=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+          if [ -n "${API_USER_ID:-}" ]; then
+            CURL_HEADERS+=(-H "X-User-Id: $API_USER_ID")
           fi
 
-          ANALYSIS_ID=$(echo "$BODY" | jq -r '.analysis_id')
+          RESP="$(curl -sS -w "\n%{http_code}" -X POST "$API_URL/v1/analyze" "${CURL_HEADERS[@]}" --data-binary @request.json)"
+          HTTP_CODE="$(echo "$RESP" | tail -1)"
+          BODY="$(echo "$RESP" | sed '$d')"
 
-          if [ "$ANALYSIS_ID" = "null" ] || [ -z "$ANALYSIS_ID" ]; then
-            echo "::error::No analysis_id in response"
+          echo "HTTP $HTTP_CODE"
+          echo "$BODY" | head -c 800 || true
+          echo
+
+          if [ "$HTTP_CODE" = "409" ]; then
+            # DUPLICATE_ANALYSIS -> on réutilise existing_id (utile pour relancer manuellement un même PR)
+            ANALYSIS_ID="$(echo "$BODY" | jq -r '.error.details.existing_id // empty')"
+            if [ -z "$ANALYSIS_ID" ]; then
+              echo "::error::409 reçu mais existing_id absent"
+              exit 1
+            fi
+            echo "Duplicate analysis detected, reusing: $ANALYSIS_ID"
+          elif [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::API returned $HTTP_CODE"
             exit 1
+          else
+            ANALYSIS_ID="$(echo "$BODY" | jq -r '.analysis_id // empty')"
+            if [ -z "$ANALYSIS_ID" ]; then
+              echo "::error::No analysis_id in response"
+              exit 1
+            fi
           fi
 
           echo "analysis_id=$ANALYSIS_ID" >> "$GITHUB_OUTPUT"
 
-      # ── 4. Poll GET /v1/analyses/{id} ──
       - name: Poll analysis result
         id: poll
         shell: bash
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
           API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
+          API_USER_ID: ${{ secrets.AI_REVIEW_USER_ID }}
         run: |
-          set -e
+          set -euo pipefail
+
+          API_URL="${API_URL%/}"
           ID="${{ steps.call.outputs.analysis_id }}"
-          echo "Polling analysis $ID …"
+          echo "Polling analysis $ID ..."
 
-          for i in $(seq 1 60); do   # up to 5 minutes
-            RESP=$(curl -sS "$API_URL/v1/analyses/$ID" \
-              -H "Authorization: Bearer $API_TOKEN")
+          CURL_HEADERS=()
+          if [ -n "${API_TOKEN:-}" ]; then
+            CURL_HEADERS+=(-H "Authorization: Bearer $API_TOKEN")
+          fi
+          if [ -n "${API_USER_ID:-}" ]; then
+            CURL_HEADERS+=(-H "X-User-Id: $API_USER_ID")
+          fi
 
-            STATUS=$(echo "$RESP" | jq -r '.status // .data.status // empty' | tr -d '\r\n ')
-            echo "  [$i] status=$STATUS"
+          for i in $(seq 1 72); do
+            RESP="$(curl -sS -w "\n%{http_code}" "$API_URL/v1/analyses/$ID" "${CURL_HEADERS[@]}")"
+            HTTP_CODE="$(echo "$RESP" | tail -1)"
+            BODY="$(echo "$RESP" | sed '$d')"
 
-            # Debug إذا status فارغ
-            if [ -z "$STATUS" ]; then
-              echo "WARN: status not found. Response preview:"
-              echo "$RESP" | head -c 500
-              echo ""
+            if [ "$HTTP_CODE" -ge 400 ]; then
+              echo "::error::Polling failed with HTTP $HTTP_CODE"
+              echo "$BODY" | head -c 800 || true
+              exit 1
             fi
 
+            STATUS="$(echo "$BODY" | jq -r '.status // empty' | tr -d '\r\n ')"
+            echo "[$i] status=$STATUS"
+
             if [ "$STATUS" = "COMPLETED" ]; then
-              echo "$RESP" > result.json
+              echo "$BODY" > result.json
               break
             fi
 
             if [ "$STATUS" = "FAILED" ]; then
-              echo "::error::Analysis failed — $RESP"
+              echo "::error::Analysis failed"
+              echo "$BODY" | jq -r '.error_message // .error.message // "Unknown error"'
               exit 1
             fi
 
@@ -155,24 +176,33 @@ jobs:
             exit 1
           fi
 
-      # ── 5. Gate: PASS / WARN / FAIL ──
       - name: Decide PASS / WARN / FAIL
         shell: bash
         run: |
-          set -e
-          DECISION=$(jq -r '.decision // "PASS"' result.json)
-          FINDINGS=$(jq '.findings | length' result.json)
-          echo "Decision: $DECISION  ($FINDINGS findings)"
+          set -euo pipefail
+
+          BLOCKERS="$(jq '[.findings[]? | select(.severity == "BLOCKER")] | length' result.json)"
+          WARNS="$(jq '[.findings[]? | select(.severity == "WARN")] | length' result.json)"
+          INFOS="$(jq '[.findings[]? | select(.severity == "INFO")] | length' result.json)"
+          CHANGE_TYPE="$(jq -r '.change_type // "unknown"' result.json)"
+          CHANGE_CONF="$(jq -r '.change_type_confidence // 0' result.json)"
+
+          if [ "$BLOCKERS" -gt 0 ]; then
+            DECISION="FAIL"
+          elif [ "$WARNS" -gt 0 ] || [ "$INFOS" -gt 0 ]; then
+            DECISION="WARN"
+          else
+            DECISION="PASS"
+          fi
+
+          echo "Decision: $DECISION | change_type=$CHANGE_TYPE ($CHANGE_CONF) | blocker=$BLOCKERS warn=$WARNS info=$INFOS"
 
           if [ "$DECISION" = "FAIL" ]; then
             echo "::error::Review decision is FAIL — blocking merge"
-            jq '.findings[] | "  [\(.severity)] \(.rule_id): \(.message)"' -r result.json
+            jq -r '.findings[]? | select(.severity == "BLOCKER") | "  [\(.severity)] \(.rule_id // "N/A"): \(.message)"' result.json
             exit 1
           fi
 
-          echo "Review passed ($DECISION)"
-
-      # ── 6. Always upload artifacts ──
       - name: Upload review artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -182,3 +212,4 @@ jobs:
             pr.diff
             request.json
             result.json
+          if-no-files-found: warn
