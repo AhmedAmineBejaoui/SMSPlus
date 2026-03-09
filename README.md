@@ -121,6 +121,7 @@ php artisan test
 | `cdr:run-local` | Meme pipeline mais depuis des dossiers locaux (`--mmg-path=`, `--occ-path=`). |
 | `cdr:ftp-list` | Teste la connexion FTP et liste les fichiers (`--dir=`). |
 | `cdr:cache-columns` | Gere le cache des colonnes TMP Oracle (`--only=`, `--clear`, `--show`). |
+| `cdr:preflight` | Valide un CSV en dry-run avant import (`file`, `--type=occ|mmg`, `--mode=detail|tmp`). |
 
 ### Pipeline `cdr:run` (detail)
 
@@ -289,5 +290,4 @@ Voir [composer.json](composer.json) et [package.json](package.json)
 **Logs du pipeline CDR**
 - `storage/logs/cdr-schedule.log` (sortie planifiee)
 - `storage/logs/laravel.log` (logs applicatifs)
-
 
