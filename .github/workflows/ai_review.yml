@@ -29,7 +29,6 @@ jobs:
 
           git diff --unified=3 "$BASE_SHA" "$HEAD_SHA" > pr.diff
 
-          # backend MAX_DIFF_BYTES = 2_000_000, on garde une marge
           MAX_BYTES=1900000
           BYTES=$(wc -c < pr.diff)
           echo "Diff size: $BYTES bytes"
@@ -43,12 +42,11 @@ jobs:
         shell: bash
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
-          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}   # optionnel
-          API_USER_ID: ${{ secrets.AI_REVIEW_USER_ID }}   # optionnel (si RBAC activé côté backend)
         run: |
           set -euo pipefail
 
           API_URL="${API_URL%/}"
+          [ -n "${API_URL:-}" ] || { echo "::error::AI_REVIEW_API_URL is missing"; exit 1; }
 
           REPO="${{ github.repository }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
@@ -84,15 +82,7 @@ jobs:
               }
             }' > request.json
 
-          CURL_HEADERS=(-H "Content-Type: application/json")
-          if [ -n "${API_TOKEN:-}" ]; then
-            CURL_HEADERS+=(-H "Authorization: Bearer $API_TOKEN")
-          fi
-          if [ -n "${API_USER_ID:-}" ]; then
-            CURL_HEADERS+=(-H "X-User-Id: $API_USER_ID")
-          fi
-
-          RESP="$(curl -sS -w "\n%{http_code}" -X POST "$API_URL/v1/analyze" "${CURL_HEADERS[@]}" --data-binary @request.json)"
+          RESP="$(curl -sS -w "\n%{http_code}" -X POST "$API_URL/v1/analyze" -H "Content-Type: application/json" --data-binary @request.json)"
           HTTP_CODE="$(echo "$RESP" | tail -1)"
           BODY="$(echo "$RESP" | sed '$d')"
 
@@ -101,7 +91,6 @@ jobs:
           echo
 
           if [ "$HTTP_CODE" = "409" ]; then
-            # DUPLICATE_ANALYSIS -> on réutilise existing_id (utile pour relancer manuellement un même PR)
             ANALYSIS_ID="$(echo "$BODY" | jq -r '.error.details.existing_id // empty')"
             if [ -z "$ANALYSIS_ID" ]; then
               echo "::error::409 reçu mais existing_id absent"
@@ -126,8 +115,6 @@ jobs:
         shell: bash
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
-          API_TOKEN: ${{ secrets.AI_REVIEW_API_TOKEN }}
-          API_USER_ID: ${{ secrets.AI_REVIEW_USER_ID }}
         run: |
           set -euo pipefail
 
@@ -135,16 +122,8 @@ jobs:
           ID="${{ steps.call.outputs.analysis_id }}"
           echo "Polling analysis $ID ..."
 
-          CURL_HEADERS=()
-          if [ -n "${API_TOKEN:-}" ]; then
-            CURL_HEADERS+=(-H "Authorization: Bearer $API_TOKEN")
-          fi
-          if [ -n "${API_USER_ID:-}" ]; then
-            CURL_HEADERS+=(-H "X-User-Id: $API_USER_ID")
-          fi
-
           for i in $(seq 1 72); do
-            RESP="$(curl -sS -w "\n%{http_code}" "$API_URL/v1/analyses/$ID" "${CURL_HEADERS[@]}")"
+            RESP="$(curl -sS -w "\n%{http_code}" "$API_URL/v1/analyses/$ID")"
             HTTP_CODE="$(echo "$RESP" | tail -1)"
             BODY="$(echo "$RESP" | sed '$d')"
 
@@ -212,5 +191,4 @@ jobs:
             pr.diff
             request.json
             result.json
-            
           if-no-files-found: warn
