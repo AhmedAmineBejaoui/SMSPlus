@@ -27,3 +27,6 @@
 
 
 DONE OK
+
+
+APP_KEY=base64:Rfnxinqq/ZznLhvHmS96sE8St5H+EzKkjUgvtff7vOA=

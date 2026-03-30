@@ -1,0 +1,141 @@
+name: CI + AI Review + Auto Merge
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # 1. CI: Lint + Tests
+  # ─────────────────────────────────────────────
+  ci:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: simplepass
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          cd apps/backend
+          poetry install
+
+      - name: Lint
+        run: |
+          cd apps/backend
+          poetry run ruff check .
+
+      - name: Tests
+        env:
+          DATABASE_URL: postgresql://postgres:simplepass@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          cd apps/backend
+          poetry run pytest tests/ -q
+
+  # ─────────────────────────────────────────────
+  # 2. AI Review (RAG)
+  # ─────────────────────────────────────────────
+  ai-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate diff
+        run: |
+          git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > pr.diff
+
+      - name: Call AI backend
+        id: ai
+        env:
+          API_URL: ${{ secrets.AI_REVIEW_API_URL }}
+        run: |
+          RESPONSE=$(curl -s -X POST "$API_URL/analyze" \
+            -H "Content-Type: application/json" \
+            -d "{\"diff\": \"$(cat pr.diff | sed 's/"/\\"/g')\"}")
+
+          echo "$RESPONSE" > result.json
+
+      - name: Parse AI result
+        id: decision
+        run: |
+          BLOCKERS=$(jq '[.findings[] | select(.severity=="BLOCKER")] | length' result.json)
+
+          if [ "$BLOCKERS" -gt 0 ]; then
+            echo "decision=FAIL" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "decision=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Comment PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = "## 🤖 AI Review\n";
+            if (fs.existsSync("result.json")) {
+              const data = JSON.parse(fs.readFileSync("result.json"));
+              body += JSON.stringify(data, null, 2);
+            }
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+  # ─────────────────────────────────────────────
+  # 3. Auto Merge (if everything PASS)
+  # ─────────────────────────────────────────────
+  auto-merge:
+    name: Auto Merge PR
+    runs-on: ubuntu-latest
+    needs: [ci, ai-review]
+
+    if: success()
+
+    steps:
+      - name: Enable auto-merge
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          pull-request-number: ${{ github.event.pull_request.number }}
+          merge-method: squash
