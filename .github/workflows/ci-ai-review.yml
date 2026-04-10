@@ -1,3 +1,4 @@
+````yaml
 name: CI + AI Review + Auto Merge
 
 on:
@@ -15,6 +16,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
+  BACKEND_DIR: "apps/backend"
 
 jobs:
 
@@ -43,31 +45,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Debug repo structure
+        run: |
+          echo "📁 Root:"
+          ls -la
+          echo "📁 apps:"
+          ls -la apps || echo "No apps folder"
+          echo "📁 apps/backend:"
+          ls -la apps/backend || echo "No backend folder"
+
+      - name: Verify backend directory
+        run: |
+          test -d "$BACKEND_DIR" || (echo "❌ Backend directory not found: $BACKEND_DIR" && exit 1)
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
+        working-directory: ${{ env.BACKEND_DIR }}
         run: |
           pip install poetry
-          cd apps/backend
           poetry install
 
       - name: Lint
+        working-directory: ${{ env.BACKEND_DIR }}
         run: |
-          cd apps/backend
           poetry run ruff check .
 
       - name: Tests
         env:
           DATABASE_URL: postgresql://postgres:simplepass@localhost:5432/test_db
           REDIS_URL: redis://localhost:6379/0
+        working-directory: ${{ env.BACKEND_DIR }}
         run: |
-          cd apps/backend
           poetry run pytest tests/ -q
 
   # ─────────────────────────────────────────────
-  # 2. AI Review (RAG)
+  # 2. AI Review
   # ─────────────────────────────────────────────
   ai-review:
     name: AI Code Review
@@ -88,16 +103,25 @@ jobs:
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
         run: |
+          echo "Calling AI API..."
           RESPONSE=$(curl -s -X POST "$API_URL/analyze" \
             -H "Content-Type: application/json" \
             -d "{\"diff\": \"$(cat pr.diff | sed 's/"/\\"/g')\"}")
 
           echo "$RESPONSE" > result.json
+          cat result.json
 
       - name: Parse AI result
         id: decision
         run: |
+          if [ ! -f result.json ]; then
+            echo "❌ No result.json"
+            exit 1
+          fi
+
           BLOCKERS=$(jq '[.findings[] | select(.severity=="BLOCKER")] | length' result.json)
+
+          echo "BLOCKERS=$BLOCKERS"
 
           if [ "$BLOCKERS" -gt 0 ]; then
             echo "decision=FAIL" >> $GITHUB_OUTPUT
@@ -112,11 +136,15 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let body = "## 🤖 AI Review\n";
+            let body = "## 🤖 AI Review\n\n";
+
             if (fs.existsSync("result.json")) {
               const data = JSON.parse(fs.readFileSync("result.json"));
-              body += JSON.stringify(data, null, 2);
+              body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
+            } else {
+              body += "⚠️ No AI result generated.";
             }
+
             await github.rest.issues.createComment({
               ...context.repo,
               issue_number: context.issue.number,
@@ -124,7 +152,7 @@ jobs:
             });
 
   # ─────────────────────────────────────────────
-  # 3. Auto Merge (if everything PASS)
+  # 3. Auto Merge
   # ─────────────────────────────────────────────
   auto-merge:
     name: Auto Merge PR
@@ -139,3 +167,4 @@ jobs:
         with:
           pull-request-number: ${{ github.event.pull_request.number }}
           merge-method: squash
+````
