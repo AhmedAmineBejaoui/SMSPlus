@@ -6,7 +6,7 @@ on:
     types: [opened, synchronize, reopened]
 
 # =========================
-# PERMISSIONS FIX (IMPORTANT)
+# PERMISSIONS FIX
 # =========================
 permissions:
   contents: read
@@ -63,13 +63,11 @@ jobs:
           echo "HTTP STATUS: $STATUS"
           cat result.json
 
-          # Stop if API error
           if [ "$STATUS" -ne 200 ]; then
             echo "❌ API returned HTTP error"
             exit 1
           fi
 
-          # Validate JSON format
           if ! jq empty result.json 2>/dev/null; then
             echo "❌ Invalid JSON received"
             cat result.json
@@ -93,9 +91,9 @@ jobs:
           fi
 
       # =========================
-      # 6. Comment PR (FIXED 403)
+      # 6. Comment PR (FIXED + PROPER INDENTATION)
       # =========================
-      - name: Comment PR
+      - name: Comment PR (FIX 403)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -107,23 +105,22 @@ jobs:
 
             try {
               if (fs.existsSync("result.json")) {
-                const raw = fs.readFileSync("result.json", "utf8");
-                const data = JSON.parse(raw);
+                const data = JSON.parse(fs.readFileSync("result.json", "utf8"));
 
                 body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
               } else {
                 body += "⚠️ No result.json found";
               }
             } catch (e) {
-              body += "❌ Error parsing AI response";
+              body += "❌ Error parsing response";
             }
 
-            // IMPORTANT FIX: use PR issue number safely
-            const issue_number = context.payload.pull_request.number;
+            const pr = context.payload.pull_request;
 
-            await github.rest.issues.createComment({
+            await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: issue_number,
-              body: body
+              pull_number: pr.number,
+              body: body,
+              event: "COMMENT"
             });
