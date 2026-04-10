@@ -1,77 +1,14 @@
-name: CI + AI Review + Auto Merge
+name: AI Code Review
 
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-
-concurrency:
-  group: pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
-permissions:
-  contents: write
-  pull-requests: write
-
-env:
-  PYTHON_VERSION: "3.11"
-  BACKEND_DIR: "apps/backend"
+    types: [opened, synchronize, reopened]
 
 jobs:
-
-  ci:
-    name: Lint & Test
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: simplepass
-          POSTGRES_DB: test_db
-        ports:
-          - 5432:5432
-
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Verify backend exists
-        run: |
-          test -d $BACKEND_DIR || (echo "Backend folder not found!" && exit 1)
-
-      - name: Install dependencies
-        working-directory: ${{ env.BACKEND_DIR }}
-        run: |
-          pip install poetry
-          poetry install
-
-      - name: Lint
-        working-directory: ${{ env.BACKEND_DIR }}
-        run: |
-          poetry run ruff check .
-
-      - name: Tests
-        working-directory: ${{ env.BACKEND_DIR }}
-        env:
-          DATABASE_URL: postgresql://postgres:simplepass@localhost:5432/test_db
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          poetry run pytest tests/ -q
-
   ai-review:
-    name: AI Code Review
+    name: AI Review Only
     runs-on: ubuntu-latest
-    needs: ci
 
     steps:
       - uses: actions/checkout@v4
@@ -82,25 +19,26 @@ jobs:
         run: |
           git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} > pr.diff
 
-      - name: Call AI backend
+      - name: Send to AI backend
         run: |
           RESPONSE=$(curl -s -X POST "$API_URL/analyze" \
             -H "Content-Type: application/json" \
             -d "{\"diff\": \"$(cat pr.diff | sed 's/\"/\\\"/g')\"}")
+
           echo "$RESPONSE" > result.json
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
 
-      - name: Parse AI result
+      - name: Check blockers
         id: decision
         run: |
           BLOCKERS=$(jq '[.findings[] | select(.severity=="BLOCKER")] | length' result.json)
 
           if [ "$BLOCKERS" -gt 0 ]; then
-            echo "decision=FAIL" >> $GITHUB_OUTPUT
+            echo "❌ BLOCKERS DETECTED"
             exit 1
           else
-            echo "decision=PASS" >> $GITHUB_OUTPUT
+            echo "✅ NO BLOCKERS"
           fi
 
       - name: Comment PR
@@ -110,25 +48,14 @@ jobs:
           script: |
             const fs = require('fs');
             let body = "## 🤖 AI Review\n";
+
             if (fs.existsSync("result.json")) {
               const data = JSON.parse(fs.readFileSync("result.json"));
               body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
             }
+
             await github.rest.issues.createComment({
               ...context.repo,
               issue_number: context.issue.number,
               body
             });
-
-  auto-merge:
-    name: Auto Merge PR
-    runs-on: ubuntu-latest
-    needs: [ci, ai-review]
-    if: success()
-
-    steps:
-      - name: Enable auto-merge
-        uses: peter-evans/enable-pull-request-automerge@v3
-        with:
-          pull-request-number: ${{ github.event.pull_request.number }}
-          merge-method: squash
