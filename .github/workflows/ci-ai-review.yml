@@ -5,6 +5,10 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   ai-review:
     name: AI Review Only
@@ -15,18 +19,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # =========================
-      # 1. Generate DIFF
-      # =========================
       - name: Generate diff
         run: |
           git diff ${{ github.event.pull_request.base.sha }} \
                    ${{ github.event.pull_request.head.sha }} > pr.diff
 
-      # =========================
-      # 2. Call AI Backend (SAFE)
-      # =========================
-      - name: Call AI backend (safe request)
+      - name: Call AI backend
         run: |
           RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
             -X POST "$API_URL/analyze" \
@@ -38,10 +36,7 @@ jobs:
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
 
-      # =========================
-      # 3. Extract JSON safely
-      # =========================
-      - name: Extract JSON safely
+      - name: Validate API response
         run: |
           BODY=$(sed '/HTTP_STATUS:/d' raw_response.txt)
           STATUS=$(grep HTTP_STATUS raw_response.txt | cut -d: -f2)
@@ -51,63 +46,56 @@ jobs:
           echo "HTTP STATUS: $STATUS"
           cat result.json
 
-          # Stop if HTTP error
           if [ "$STATUS" -ne 200 ]; then
-            echo "❌ API returned HTTP error"
+            echo "API returned HTTP $STATUS"
             exit 1
           fi
 
-          # Validate JSON
           if ! jq empty result.json 2>/dev/null; then
-            echo "❌ Invalid JSON received from API"
+            echo "Invalid JSON received"
             cat result.json
             exit 1
           fi
 
-      # =========================
-      # 4. Check BLOCKERS (SAFE)
-      # =========================
       - name: Check blockers
-        id: decision
         run: |
           BLOCKERS=$(jq '[.findings[]? | select(.severity=="BLOCKER")] | length' result.json)
 
-          echo "BLOCKERS: $BLOCKERS"
+          echo "BLOCKERS FOUND: $BLOCKERS"
 
           if [ "$BLOCKERS" -gt 0 ]; then
-            echo "❌ BLOCKERS FOUND"
+            echo "BLOCKERS DETECTED"
             exit 1
           else
-            echo "✅ NO BLOCKERS"
+            echo "NO BLOCKERS"
           fi
 
-      # =========================
-      # 5. Comment PR safely
-      # =========================
       - name: Comment PR
         if: always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
 
-            let body = "## 🤖 AI Code Review\n";
+            let body = "## AI Code Review\n\n";
 
             try {
               if (fs.existsSync("result.json")) {
                 const raw = fs.readFileSync("result.json", "utf8");
                 const data = JSON.parse(raw);
-
                 body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
               } else {
-                body += "\n⚠️ No result.json found";
+                body += "No result.json found";
               }
             } catch (e) {
-              body += "\n❌ Error parsing AI response (invalid JSON)";
+              body += "Error parsing AI response";
             }
 
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.issue.number,
-              body
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              body: body,
+              event: "COMMENT"
             });
