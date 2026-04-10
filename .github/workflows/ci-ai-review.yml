@@ -5,18 +5,30 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
 
+# =========================
+# PERMISSIONS FIX (IMPORTANT)
+# =========================
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   ai-review:
     name: AI Review Only
     runs-on: ubuntu-latest
 
     steps:
+
+      # =========================
+      # 1. Checkout
+      # =========================
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # =========================
-      # 1. Generate DIFF
+      # 2. Generate DIFF
       # =========================
       - name: Generate diff
         run: |
@@ -24,9 +36,9 @@ jobs:
                    ${{ github.event.pull_request.head.sha }} > pr.diff
 
       # =========================
-      # 2. Call AI Backend (SAFE)
+      # 3. Call AI Backend (SAFE)
       # =========================
-      - name: Call AI backend (safe request)
+      - name: Call AI backend
         run: |
           RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
             -X POST "$API_URL/analyze" \
@@ -39,9 +51,9 @@ jobs:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
 
       # =========================
-      # 3. Extract JSON safely
+      # 4. Validate API Response
       # =========================
-      - name: Extract JSON safely
+      - name: Validate API response
         run: |
           BODY=$(sed '/HTTP_STATUS:/d' raw_response.txt)
           STATUS=$(grep HTTP_STATUS raw_response.txt | cut -d: -f2)
@@ -51,47 +63,47 @@ jobs:
           echo "HTTP STATUS: $STATUS"
           cat result.json
 
-          # Stop if HTTP error
+          # Stop if API error
           if [ "$STATUS" -ne 200 ]; then
             echo "❌ API returned HTTP error"
             exit 1
           fi
 
-          # Validate JSON
+          # Validate JSON format
           if ! jq empty result.json 2>/dev/null; then
-            echo "❌ Invalid JSON received from API"
+            echo "❌ Invalid JSON received"
             cat result.json
             exit 1
           fi
 
       # =========================
-      # 4. Check BLOCKERS (SAFE)
+      # 5. Check BLOCKERS
       # =========================
       - name: Check blockers
-        id: decision
         run: |
           BLOCKERS=$(jq '[.findings[]? | select(.severity=="BLOCKER")] | length' result.json)
 
-          echo "BLOCKERS: $BLOCKERS"
+          echo "BLOCKERS FOUND: $BLOCKERS"
 
           if [ "$BLOCKERS" -gt 0 ]; then
-            echo "❌ BLOCKERS FOUND"
+            echo "❌ BLOCKERS DETECTED"
             exit 1
           else
             echo "✅ NO BLOCKERS"
           fi
 
       # =========================
-      # 5. Comment PR safely
+      # 6. Comment PR (FIXED 403)
       # =========================
       - name: Comment PR
         if: always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
 
-            let body = "## 🤖 AI Code Review\n";
+            let body = "## 🤖 AI Code Review\n\n";
 
             try {
               if (fs.existsSync("result.json")) {
@@ -100,14 +112,18 @@ jobs:
 
                 body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
               } else {
-                body += "\n⚠️ No result.json found";
+                body += "⚠️ No result.json found";
               }
             } catch (e) {
-              body += "\n❌ Error parsing AI response (invalid JSON)";
+              body += "❌ Error parsing AI response";
             }
 
+            // IMPORTANT FIX: use PR issue number safely
+            const issue_number = context.payload.pull_request.number;
+
             await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.issue.number,
-              body
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue_number,
+              body: body
             });
