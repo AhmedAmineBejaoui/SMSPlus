@@ -5,9 +5,13 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
 
+# =========================
+# PERMISSIONS FIX
+# =========================
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 jobs:
   ai-review:
@@ -15,15 +19,25 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # =========================
+      # 1. Checkout
+      # =========================
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # =========================
+      # 2. Generate DIFF
+      # =========================
       - name: Generate diff
         run: |
           git diff ${{ github.event.pull_request.base.sha }} \
                    ${{ github.event.pull_request.head.sha }} > pr.diff
 
+      # =========================
+      # 3. Call AI Backend (SAFE)
+      # =========================
       - name: Call AI backend
         run: |
           RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
@@ -36,6 +50,9 @@ jobs:
         env:
           API_URL: ${{ secrets.AI_REVIEW_API_URL }}
 
+      # =========================
+      # 4. Validate API Response
+      # =========================
       - name: Validate API response
         run: |
           BODY=$(sed '/HTTP_STATUS:/d' raw_response.txt)
@@ -52,11 +69,14 @@ jobs:
           fi
 
           if ! jq empty result.json 2>/dev/null; then
-            echo "Invalid JSON received"
+            echo "❌ Invalid JSON received"
             cat result.json
             exit 1
           fi
 
+      # =========================
+      # 5. Check BLOCKERS
+      # =========================
       - name: Check blockers
         run: |
           BLOCKERS=$(jq '[.findings[]? | select(.severity=="BLOCKER")] | length' result.json)
@@ -64,13 +84,16 @@ jobs:
           echo "BLOCKERS FOUND: $BLOCKERS"
 
           if [ "$BLOCKERS" -gt 0 ]; then
-            echo "BLOCKERS DETECTED"
+            echo "❌ BLOCKERS DETECTED"
             exit 1
           else
             echo "NO BLOCKERS"
           fi
 
-      - name: Comment PR
+      # =========================
+      # 6. Comment PR (FIXED + PROPER INDENTATION)
+      # =========================
+      - name: Comment PR (FIX 403)
         if: always()
         uses: actions/github-script@v7
         with:
@@ -78,24 +101,26 @@ jobs:
           script: |
             const fs = require('fs');
 
-            let body = "## AI Code Review\n\n";
+            let body = "## 🤖 AI Code Review\n\n";
 
             try {
               if (fs.existsSync("result.json")) {
-                const raw = fs.readFileSync("result.json", "utf8");
-                const data = JSON.parse(raw);
+                const data = JSON.parse(fs.readFileSync("result.json", "utf8"));
+
                 body += "```json\n" + JSON.stringify(data, null, 2) + "\n```";
               } else {
-                body += "No result.json found";
+                body += "⚠️ No result.json found";
               }
             } catch (e) {
-              body += "Error parsing AI response";
+              body += "❌ Error parsing response";
             }
+
+            const pr = context.payload.pull_request;
 
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
+              pull_number: pr.number,
               body: body,
               event: "COMMENT"
             });
