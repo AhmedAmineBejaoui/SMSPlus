@@ -64,7 +64,7 @@ jobs:
           cat result.json
 
           if [ "$STATUS" -ne 200 ]; then
-            echo "❌ API returned HTTP error"
+            echo "API returned HTTP $STATUS"
             exit 1
           fi
 
@@ -87,7 +87,7 @@ jobs:
             echo "❌ BLOCKERS DETECTED"
             exit 1
           else
-            echo "✅ NO BLOCKERS"
+            echo "NO BLOCKERS"
           fi
 
       # =========================
